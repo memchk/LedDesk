@@ -33,8 +33,15 @@ struct Args {
     #[structopt(long = "split")]
     spilt_channel: bool,
 
+    #[structopt(long = "nobar")]
+    no_bar: bool,
+
+
+
     #[structopt(default_value="0.04", long="decay")]
     decay_time: f32,
+    #[structopt(default_value="1", long="fftscale")]
+    fftscale: f32,
     #[structopt(default_value = "1536")]
     fft_size: usize,
 }
@@ -102,8 +109,9 @@ fn main() {
 
     let post = process::PageLog::new(fft_size as u32, 44100.0, 4800.0, num_leds);
 
-    //let think_time = Duration::from_millis(((fft_size as f32 / 44100.0 ) * 1010.0) as u64);
-    let think_time = Duration::from_millis(33);
+    let think_time = Duration::from_millis(((fft_size as f32 / 44100.0 ) * 1010.0) as u64);
+
+    //let think_time = Duration::from_millis(40);
 
     std::thread::spawn(move || {
         let mut fft_ol: Vec<Complex<_>> = vec![Zero::zero(); fft_size];
@@ -119,10 +127,13 @@ fn main() {
 
         let mut decay = process::ExpDecay::new(fft_size, 44100.0 / fft_size as f32, args_thread.decay_time, 1.0);
 
-        let mut l_dec = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, m_e);
-        let mut r_dec = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, m_e);
-
+        //let mut l_dec = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, m_e);
+        //let mut r_dec = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, m_e);
+        let bar_cutoff = freq_to_bin(100.0, fft_size as f32, 44100.0);
+        let bar_max_energy = m_e;
+        let mut bar_decay = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, bar_max_energy);
         let mut fft_scratch = vec![0.0f32; fft_size];
+
         loop {
             let loop_begin = Instant::now();
 
@@ -132,24 +143,10 @@ fn main() {
                 .take(fft_size)
                 .enumerate()
                 .map(|(i, (l, r))| {
-                    (l * hann(i, fft_size), r * hann(i, fft_size))
+                    (l * nutall(i, fft_size), r * nutall(i, fft_size))
                     //(l, r)
                 }).unzip();
 
-            let l_e_p = &[spectral_energy(&sl)];
-            let r_e_p = &[spectral_energy(&sr)];
-
-            let l_e = &mut [0.0f32];
-            let r_e = &mut [0.0f32];
-            l_dec.process(l_e_p, l_e, 1.0);
-            r_dec.process(r_e_p, r_e, 1.0);
-
-            let l_e = (f32::min(l_e[0] / (m_e * 0.5), 1.0) * 255.0) as u8;
-            let r_e = (f32::min(r_e[0] / (m_e * 0.5), 1.0) * 255.0) as u8;
-
-            let _ = fft_ps.try_send((l_e, r_e));
-
-            let scale = 1.0;
 
             if args_thread.spilt_channel {
                 let (mut il, mut ir) : (Vec<_>, Vec<_>) = sl.iter().zip(sr.iter()).map(|(&l, &r)| (Complex::new(l, 0.0), Complex::new(r, 0.0))).unzip();
@@ -158,18 +155,29 @@ fn main() {
 
                 fft_amp(&fft_ol, &mut fft_al, m_e);
                 fft_amp(&fft_or, &mut fft_ar, m_e);
-                post.process(&fft_al, &mut led_l, scale);
-                post.process(&fft_ar, &mut led_r, scale);
+                post.process(&fft_al, &mut led_l, args_thread.fftscale);
+                post.process(&fft_ar, &mut led_r, args_thread.fftscale);
             } else {
                 mix(&mut sl, &sr);
                 let mut im : Vec<_> = sl.iter().map(|&l| Complex::new(l, 0.0)).collect();
                 fft_thread.process(&mut im, &mut fft_ol);
 
                 fft_amp(&fft_ol, &mut fft_al, m_e);
-                
-                decay.process(&fft_al, &mut fft_scratch, scale);
+
+                // Bar Calculation
+                if !args_thread.no_bar {
+                    let e_p = spectral_energy(&fft_al[..=bar_cutoff]);
+                    let e = &mut [0.0f32];
+                    bar_decay.process(&[e_p], e, 1.0);
+                    let e = (f32::min(e[0] / bar_max_energy, 1.0) * 255.0) as u8;
+                    let _ = fft_ps.try_send((e, e));
+                } else {
+                    let _ = fft_ps.try_send((0, 0));
+                }
+
+                decay.process(&fft_al, &mut fft_scratch, 1.0);
                 std::mem::swap(&mut fft_al, &mut fft_scratch);
-                post.process(&fft_al, &mut led_l, scale);
+                post.process(&fft_al, &mut led_l, args_thread.fftscale);
             }
 
 
@@ -201,7 +209,7 @@ fn main() {
                 //     color::RGB::new(0, 0, 1)
                 // };
                 
-                let color_base = color::RGB::new(185, 0, 255);
+                let color_base = color::RGB::new(255, 0, 255);
                 (color_base * l, color_base * r)
             })
             .unzip();

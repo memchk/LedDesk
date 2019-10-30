@@ -8,8 +8,17 @@ pub fn hann(i: usize, n: usize) -> f32 {
 }
 
 #[inline]
+pub fn nutall(i: usize, n: usize) -> f32 {
+    use std::f32::consts::PI;
+    0.355768 
+    - (0.487396 * ((2.0 * PI * i as f32) / (n as f32 - 1.0)).cos())
+    + (0.144232 * ((4.0 * PI * i as f32) / (n as f32 - 1.0)).cos())
+    - (0.012604 * ((6.0 * PI * i as f32) / (n as f32 - 1.0)).cos())
+}
+
+#[inline]
 pub fn max_energy(fft_size: usize) -> f32 {
-    (0..fft_size/2).fold(0.0, |acc, x| acc + hann(x, fft_size).powi(2))
+    (0..fft_size/2).fold(0.0, |acc, x| acc + nutall(x, fft_size).powi(2))
 }
 
 #[inline]
