@@ -12,7 +12,6 @@ cpal = { path = "cpal" }
 hound = "3.4.0"
 crossbeam = "0.7.1"
 serialport = "3.2.0"
-sample = "0.10.0"
 structopt = "0.2.15"
 
 #[target.'cfg(windows)'.dependencies]
@@ -20,5 +19,4 @@ structopt = "0.2.15"
 
 [profile.release]
 debug = false
-lto = true
 panic = "abort"

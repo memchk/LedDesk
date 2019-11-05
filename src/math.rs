@@ -1,46 +1,39 @@
 use rustfft::num_complex::Complex;
 
-#[inline]
-pub fn hann(i: usize, n: usize) -> f32 {
+pub trait Window {
+    fn window(&self, data: &[f32], output: &mut [Complex<f32>]);
+}
+
+
+fn sinc_window_inner(coeff: &[f32], data: &[f32], output: &mut [Complex<f32>]) {
     use std::f32::consts::PI;
-    //(1.0 - ((2.0 * PI * i as f32) / (n as f32 - 1.0)).cos()) / 2.0
-    ((PI * i as f32) / n as f32).sin().powi(2)
+    let len = data.len();
+    for (n, x) in data.iter().enumerate() {
+        output[n] = (x * coeff.iter().enumerate().map(|(k,&a)| {
+            let kf = k as f32;
+            let n = n as f32;
+            (-1.0f32).powi(k as i32) * a * ((2.0*PI*kf*n)/(len - 1) as f32).cos()
+        }).sum::<f32>()).into();
+    }
 }
 
-#[inline]
-pub fn nutall(i: usize, n: usize) -> f32 {
-    use std::f32::consts::PI;
-    0.355768 
-    - (0.487396 * ((2.0 * PI * i as f32) / (n as f32 - 1.0)).cos())
-    + (0.144232 * ((4.0 * PI * i as f32) / (n as f32 - 1.0)).cos())
-    - (0.012604 * ((6.0 * PI * i as f32) / (n as f32 - 1.0)).cos())
+pub struct SincWindow<'a> {
+    pub coeff: &'a [f32]
 }
 
-#[inline]
-pub fn max_energy(fft_size: usize) -> f32 {
-    (0..fft_size/2).fold(0.0, |acc, x| acc + nutall(x, fft_size).powi(2))
+impl<'a> Window for SincWindow<'a> {
+    fn window(&self, data: &[f32], output: &mut [Complex<f32>]) {
+        sinc_window_inner(self.coeff, data, output);
+    }
 }
 
-#[inline]
-pub fn freq_to_bin(f: f32, size: f32, sample_rate: f32) -> usize {
-    (f / (sample_rate / size)) as usize
+pub struct NutallWindow;
+impl Window for NutallWindow {
+    fn window(&self, data: &[f32], output: &mut [Complex<f32>]) {
+        sinc_window_inner(&[0.3635819, 0.4891775, 0.1365995, 0.0106411], data, output);
+    }
 }
 
-#[inline]
-pub fn fft_amp(i: &[Complex<f32>], o: &mut [f32], m_e: f32) {
-    i.iter()
-        .zip(o.iter_mut())
-        .for_each(|(&i, o)| *o = 2.0 * (i.to_polar().0.powi(2)) / m_e);
-}
-
-#[inline]
-pub fn spectral_energy(samples: &[f32]) -> f32 {
-    samples.iter().fold(0.0, |acc, x| acc + x.powi(2))
-}
-
-#[inline]
-pub fn mix(left: &mut [f32], right: &[f32]) {
-    left.iter_mut()
-        .zip(right.iter())
-        .for_each(|(l, &o)| *l = (*l + o) / 2.0)
+pub fn f_to_bin(fft_size: usize, fs: f32, f: f32) -> usize {
+    (f * (fft_size as f32 / fs)) as usize
 }

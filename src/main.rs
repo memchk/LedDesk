@@ -1,71 +1,60 @@
-//use parking_lot::Mutex;
-//use std::sync::Arc;
-
 use crossbeam::channel;
 use rustfft::num_complex::Complex;
-use rustfft::num_traits::Zero;
-use rustfft::{FFTplanner, FFT};
-//use sample::{signal, Frame, Sample, Signal, ToFrameSliceMut};
+use rustfft::*;
 use serialport::prelude::*;
-use std::iter;
+use std::collections::VecDeque;
+use std::time::Duration;
 use structopt::StructOpt;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
 mod color;
 mod math;
 mod process;
+mod strided_chunks;
 
-use math::*;
+use color::RGB;
+use math::{NutallWindow, Window};
 use process::{Process, ProcessMut};
-
-const NUM_LEDS: usize = 82;
 
 #[derive(StructOpt, Debug, Clone)]
 struct Args {
-    // Log is the default
-    #[structopt(long = "log", group = "scale")]
-    log: bool,
-    #[structopt(long = "linear", group = "scale")]
-    linear: bool,
-    // #[structopt(long = "tonal", group = "scale")]
-    // tonal: bool,
-    #[structopt(long = "split")]
-    spilt_channel: bool,
-
     #[structopt(long = "nobar")]
     no_bar: bool,
-
-
-
-    #[structopt(default_value="0.04", long="decay")]
+    #[structopt(long = "port", default_value = "COM3")]
+    com_port: String,
+    #[structopt(default_value = "0.04", long = "decay")]
     decay_time: f32,
-    #[structopt(default_value="1", long="fftscale")]
+    #[structopt(default_value = "1", long = "fftscale")]
     fftscale: f32,
-    #[structopt(default_value = "1536")]
+    #[structopt(default_value = "8000", long = "mf")]
+    mf: f32,
+    #[structopt(long = "fft", default_value = "1536")]
     fft_size: usize,
+    #[structopt(long = "exp", default_value = "1.0")]
+    exp: f32,
+    #[structopt(long = "prescale", default_value = "2.0")]
+    prescale: f32,
+    #[structopt(long = "color", default_value = "FF00FF")]
+    color: String,
 }
+
+const NUM_LEDS: usize = 82;
 
 fn main() {
     let args = Args::from_args();
-    let device = cpal::default_output_device().expect("Failed to get default output device");
-    let format = device
-        .default_output_format()
-        .expect("Failed to get default output format");
-    let event_loop = cpal::EventLoop::new();
-    let stream_id = event_loop
-        .build_input_stream(&device, &format, true)
-        .expect("Failed to build loopback stream");
-    event_loop.play_stream(stream_id);
 
-    let num_leds = if args.spilt_channel {
-        NUM_LEDS / 2
-    } else {
-        NUM_LEDS
-    };
+    let color = RGB::from_hex(&args.color);
 
+    let (audio_sender, audio_recv) = channel::bounded(args.fft_size);
+    let _ = std::thread::spawn(move || audio_thread(audio_sender));
+
+    let (led_sender, led_recv) = channel::bounded(NUM_LEDS);
+    let cloned_args = args.clone();
+    let _ = std::thread::spawn(move || fft_thread(audio_recv, led_sender, cloned_args));
+
+
+    // Main thread takes care of sending the data down UART to micro for display.
     let mut led_port = serialport::open_with_settings(
-        "COM6",
+        &args.com_port,
         &SerialPortSettings {
             baud_rate: 500000,
             data_bits: DataBits::Eight,
@@ -77,151 +66,26 @@ fn main() {
     )
     .unwrap();
 
-    let fft_size = args.fft_size;
-
-    let (audio_s, fft_r) = channel::bounded(fft_size * 2);
-
-    // Get Audio samples and send them in a queue.
-    std::thread::spawn(move || {
-        event_loop.run(|_, data| {
-            match data {
-                cpal::StreamData::Input {
-                    buffer: cpal::UnknownTypeInputBuffer::F32(buffer),
-                } => {
-                    let lr_pairs = buffer.chunks_exact(2).map(|s| (s[0], s[1]));
-                    for x in lr_pairs {
-                        let _ = audio_s.try_send(x);
-                    }
-                }
-                _ => (),
-            }
-        });
-    });
-
-    let mut planner = FFTplanner::new(false);
-    let fft = planner.plan_fft(fft_size);
-
-    let fft_thread = fft.clone();
-    let (fft_s, led_r) = channel::bounded(fft_size * 10);
-    let (fft_ps, led_pr) = channel::bounded(fft_size);
-
-    let args_thread = args.clone();
-
-    let post = process::PageLog::new(fft_size as u32, 44100.0, 4800.0, num_leds);
-
-    let think_time = Duration::from_millis(((fft_size as f32 / 44100.0 ) * 1010.0) as u64);
-
-    //let think_time = Duration::from_millis(40);
-
-    std::thread::spawn(move || {
-        let mut fft_ol: Vec<Complex<_>> = vec![Zero::zero(); fft_size];
-        let mut fft_or: Vec<Complex<_>> = vec![Zero::zero(); fft_size];
-
-        let mut fft_al: Vec<_> = vec![0.0f32; fft_size / 2];
-        let mut fft_ar: Vec<_> = vec![0.0f32; fft_size / 2];
-
-        let mut led_l: Vec<_> = vec![0.0; num_leds];
-        let mut led_r: Vec<_> = vec![0.0; num_leds];
-
-        let m_e = max_energy(fft_size);
-
-        let mut decay = process::ExpDecay::new(fft_size, 44100.0 / fft_size as f32, args_thread.decay_time, 1.0);
-
-        //let mut l_dec = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, m_e);
-        //let mut r_dec = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, m_e);
-        let bar_cutoff = freq_to_bin(100.0, fft_size as f32, 44100.0);
-        let bar_max_energy = m_e;
-        let mut bar_decay = process::ExpDecay::new(1, 44100.0 / fft_size as f32, args_thread.decay_time, bar_max_energy);
-        let mut fft_scratch = vec![0.0f32; fft_size];
-
-        loop {
-            let loop_begin = Instant::now();
-
-            let (mut sl, sr): (Vec<_>, Vec<_>) = fft_r
-                .try_iter()
-                .chain(iter::repeat((0.0, 0.0)))
-                .take(fft_size)
-                .enumerate()
-                .map(|(i, (l, r))| {
-                    (l * nutall(i, fft_size), r * nutall(i, fft_size))
-                    //(l, r)
-                }).unzip();
-
-
-            if args_thread.spilt_channel {
-                let (mut il, mut ir) : (Vec<_>, Vec<_>) = sl.iter().zip(sr.iter()).map(|(&l, &r)| (Complex::new(l, 0.0), Complex::new(r, 0.0))).unzip();
-                fft_thread.process(&mut il, &mut fft_ol);
-                fft_thread.process(&mut ir, &mut fft_or);
-
-                fft_amp(&fft_ol, &mut fft_al, m_e);
-                fft_amp(&fft_or, &mut fft_ar, m_e);
-                post.process(&fft_al, &mut led_l, args_thread.fftscale);
-                post.process(&fft_ar, &mut led_r, args_thread.fftscale);
-            } else {
-                mix(&mut sl, &sr);
-                let mut im : Vec<_> = sl.iter().map(|&l| Complex::new(l, 0.0)).collect();
-                fft_thread.process(&mut im, &mut fft_ol);
-
-                fft_amp(&fft_ol, &mut fft_al, m_e);
-
-                // Bar Calculation
-                if !args_thread.no_bar {
-                    let e_p = spectral_energy(&fft_al[..=bar_cutoff]);
-                    let e = &mut [0.0f32];
-                    bar_decay.process(&[e_p], e, 1.0);
-                    let e = (f32::min(e[0] / bar_max_energy, 1.0) * 255.0) as u8;
-                    let _ = fft_ps.try_send((e, e));
-                } else {
-                    let _ = fft_ps.try_send((0, 0));
-                }
-
-                decay.process(&fft_al, &mut fft_scratch, 1.0);
-                std::mem::swap(&mut fft_al, &mut fft_scratch);
-                post.process(&fft_al, &mut led_l, args_thread.fftscale);
-            }
-
-
-            for (&l, &r) in led_l.iter().zip(led_r.iter()) {
-                let _ = fft_s.try_send((l, r));
-            }
-
-            if let Some(sleep_time) = think_time.checked_sub(loop_begin.elapsed()) {
-                sleep(sleep_time);
-            }
-
-        }
-    });
-
-    use std::io::prelude::*;
-
-    let mut buf = Vec::with_capacity(50 * 3 + 50*3 + NUM_LEDS * 4);
+    let mut buf = Vec::with_capacity(50 * 3 + 50 * 3 + NUM_LEDS * 4);
+    let mut frame = Vec::with_capacity(NUM_LEDS);
     loop {
-        let (l_frame, r_frame): (Vec<_>, Vec<_>) = led_r
+        // Setup a channel iterator, then fill the framebuffer after clearing it.
+        let frame_iter = led_recv
             .iter()
-            .take(num_leds)
+            .take(NUM_LEDS)
             .enumerate()
-            .map(|(i, (l, r))| {
-                // let color_base = if i < (num_leds / 3) {
-                //     color::RGB::new(1, 0, 0)
-                // } else if i < (2 * num_leds) / 3 {
-                //     color::RGB::new(0, 1, 0)
-                // } else {
-                //     color::RGB::new(0, 0, 1)
-                // };
-                
-                let color_base = color::RGB::new(255, 0, 255);
-                (color_base * l, color_base * r)
-            })
-            .unzip();
+            .map(|(_, led)| color * led);
 
-        let (l_e, r_e) = led_pr.recv().unwrap();
+        frame.clear();
+        frame.extend(frame_iter);
 
-        let l_bar: Vec<_> = std::iter::repeat(l_e)
+        let bar_e = 0;
+        let l_bar: Vec<_> = std::iter::repeat(bar_e)
             .take(50)
             .map(|e| color::RGB::new(e, e, e))
             .collect();
 
-        let r_bar: Vec<_> = std::iter::repeat(r_e)
+        let r_bar: Vec<_> = std::iter::repeat(bar_e)
             .take(50)
             .map(|e| color::RGB::new(e, e, e))
             .collect();
@@ -229,26 +93,128 @@ fn main() {
         buf.extend_from_slice(b"Ada");
         buf.extend_from_slice(&[0x01, 0x06, 0x52]);
 
-        if args.spilt_channel {
-            // Top of Desk
-            buf.extend(r_frame.iter().rev().flat_map(color::RGB::as_slice));
-            buf.extend(l_frame.iter().flat_map(color::RGB::as_slice));
-            buf.extend(l_bar.iter().flat_map(color::RGB::as_slice));
+        buf.extend(frame.iter().rev().flat_map(color::RGB::as_slice));
+        buf.extend(l_bar.iter().flat_map(color::RGB::as_slice));
+        // Bottom
+        buf.extend(frame.iter().flat_map(color::RGB::as_slice));
+        buf.extend(r_bar.iter().flat_map(color::RGB::as_slice));
 
-            // Bottom
-            buf.extend(l_frame.iter().rev().flat_map(color::RGB::as_slice));
-            buf.extend(r_frame.iter().flat_map(color::RGB::as_slice));
-            buf.extend(r_bar.iter().flat_map(color::RGB::as_slice));
-        } else {
-            buf.extend(l_frame.iter().rev().flat_map(color::RGB::as_slice));
-            buf.extend(l_bar.iter().flat_map(color::RGB::as_slice));
-            // Bottom
-            buf.extend(l_frame.iter().flat_map(color::RGB::as_slice));
-            buf.extend(r_bar.iter().flat_map(color::RGB::as_slice));
-        }
-        
         let _ = led_port.write_all(&buf);
         let _ = led_port.flush();
         buf.clear();
     }
+}
+
+// FFT processing.
+fn fft_thread(
+    audio_reciever: channel::Receiver<(f32, f32)>,
+    led_sender: channel::Sender<f32>,
+    args: Args,
+) {
+    let fft_size = args.fft_size;
+    let fft_nyquist = fft_size / 2;
+
+    // Allocate a shitload of buffers ahead of time, dynamic allocations in a tight loop are bad mmkay.
+    let mut planner = FFTplanner::new(false);
+    let fft = planner.plan_fft(fft_size);
+    let mut sample_vec = VecDeque::with_capacity(fft_size);
+    let mut windowed_samples = vec![Complex::default(); fft_size];
+    let mut fft_data = vec![Complex::default(); fft_size];
+    let mut f32_scratch = vec![0.0; fft_size];
+    let mut leds = vec![0.0; NUM_LEDS];
+
+    // Only interested in the first half since the is real data, and because
+    // nyquist is a bitch.
+    let mut fft_energy = vec![0.0; fft_nyquist];
+
+    // Calculate the overlap to faciliate a pseudo-welch's method.
+    let overlap = fft_size / 2;
+
+    // Setup the principal decay engine.
+    let mut fft_decay = process::ExpDecay::new(
+        fft_nyquist,
+        44100.0 / fft_nyquist as f32,
+        args.decay_time,
+        1.0,
+    );
+
+    // Setup the Frequency -> LED mapper.
+    let led_map = process::PageLog::new(fft_size, 44100.0, args.mf, NUM_LEDS);
+
+    loop {
+        // Create a running buffer, dropping and consuming `overlap` amounts of data each time, except for initial fill.
+        // fill from the audio thread.
+        let drain_amount = std::cmp::min(sample_vec.len(), overlap);
+        sample_vec.drain(..drain_amount);
+
+        let sample_iterator = audio_reciever
+            .iter()
+            .take(fft_size - sample_vec.len())
+            .map(|(l, r)| (l + r) / 2.0);
+        
+        sample_vec.extend(sample_iterator);
+
+        // Copy into a continous buffer since a dequeue is represented as two slices.
+        let (sample_left, sample_right) = sample_vec.as_slices();
+        let left_len = sample_left.len();
+        let (scratch_l, scratch_r) = f32_scratch.split_at_mut(left_len);
+        scratch_l.copy_from_slice(sample_left);
+        scratch_r.copy_from_slice(sample_right);
+
+        // Window the data to prevent spectral contamination, then compute the FFT.
+        NutallWindow.window(&f32_scratch[..], &mut windowed_samples[..]);
+        fft.process(&mut windowed_samples[..], &mut fft_data[..]);
+
+        for (c, a) in fft_data.iter().zip(fft_energy.iter_mut()) {
+            // First get the amplitude, normalize by dividing by the nyquist bin, then apply a prescaler.
+            let amplitude = args.prescale * c.to_polar().0 / fft_nyquist as f32;
+            // Apply a power function to require at args.exp > 1.0 a more powerful signal to trigger an led activation.
+            *a = amplitude.powf(args.exp);
+        }
+
+        // Process the decay, then calculate the log magnitude from there.
+        fft_decay.process(&mut fft_energy[..], &mut f32_scratch[..], 1.0);
+
+        // Floor the function if nessiary, then apply a postscaler.
+        for (&i, o) in f32_scratch.iter().zip(fft_energy.iter_mut()) {
+            if i < 0.001 {
+                *o = 0.0;
+            } else {
+                //*o = args.fftscale * i.sqrt();
+                *o = args.fftscale * i;
+            }
+        }
+
+        // Map to leds, and send to the main thread for display.
+        led_map.process(&fft_energy[..], &mut leds[..], 1.0);
+        for &l in &leds {
+            let _ = led_sender.try_send(l);
+        }
+    }
+}
+
+// Principal audio thread. This pulls data from windows WASAPI and streams it into a crossbeam
+// channel for further processing.
+fn audio_thread(audio_channel: channel::Sender<(f32, f32)>) {
+    let device = cpal::default_output_device().expect("Could not get output device.");
+    let format = device
+        .default_output_format()
+        .expect("Could not get output format.");
+    let event_loop = cpal::EventLoop::new();
+    let id = event_loop
+        .build_input_stream(&device, &format, true)
+        .unwrap();
+
+    event_loop.play_stream(id);
+    event_loop.run(|_, data| match data {
+        cpal::StreamData::Input {
+            buffer: cpal::UnknownTypeInputBuffer::F32(buffer),
+        } => {
+            let lr_pairs = buffer.chunks_exact(2).map(|x| (x[0], x[1]));
+            for pair in lr_pairs {
+                let _ = audio_channel.try_send(pair);
+            }
+        }
+        _ => {}
+    });
 }

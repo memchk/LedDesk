@@ -11,6 +11,15 @@ impl RGB {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn from_hex(hex: &str) -> Self {
+        let tmp = u32::from_str_radix(hex, 16).unwrap();
+        let r: u8 = ((tmp >> 16) & 0xFF) as u8;
+        let g: u8 = ((tmp >> 8) & 0xFF) as u8;
+        let b: u8 = (tmp & 0xFF) as u8;
+
+        RGB([r, g, b])
+    }
 }
 
 impl Mul<u8> for RGB {

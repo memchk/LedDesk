@@ -14,8 +14,8 @@ pub struct PageLog {
 
 impl PageLog {
     // Shifted rounding scheme to reduce smearing
-    pub fn new(fft_size: u32, sample_rate: f32, max_frequency: f32, num_leds: usize) -> Self {
-        let base = freq_to_bin(max_frequency, fft_size as f32, sample_rate) as f32;
+    pub fn new(fft_size: usize, sample_rate: f32, max_frequency: f32, num_leds: usize) -> Self {
+        let base = f_to_bin(fft_size, sample_rate, max_frequency) as f32;
 
         let bins = (0..num_leds).map(|idx| {
             let b1 = f32::min(base.powf(idx as f32 / ((num_leds as f32) - 1.0)), (fft_size as f32/ 2.0) - 1.0);
@@ -30,14 +30,14 @@ impl PageLog {
 }
 
 impl Process<f32, f32> for PageLog {
-    fn process(&self, sig: &[f32], output: &mut[f32], scale: f32) {
+    fn process(&self, sig: &[f32], output: &mut[f32], _: f32) {
         let mut b0 = 0;
         for (&bin, o) in self.led_bin_map.iter().zip(output.iter_mut()) {
             let diff = usize::max(bin-b0, 1);
             let val = sig.iter().skip(b0).take(diff).fold(0.0, |acc, &x| return acc + x) / diff as f32;
 
             //let val_norm = (f32::min(val / scale, 1.0) * 255.0) as u8;
-            let val_norm = f32::min(val * scale, 1.0);
+            let val_norm = f32::min(val, 1.0);
             *o = val_norm;
             b0 = bin;
         }
@@ -66,7 +66,7 @@ impl ProcessMut<f32, f32> for ExpDecay {
         for (&i, (o, m)) in sig.iter().zip(output.iter_mut().zip(self.memory.iter_mut())) {
             let mut tmp = self.decay_rate * *m;
             tmp += i;
-            if tmp < 0.005 {tmp = 0.0}
+            if tmp < 0.0000005 {tmp = 0.0}
             tmp = f32::min(tmp, self.max);
 
             *m = tmp;
