@@ -114,7 +114,7 @@ fn fft_thread(
     let fft_size = args.fft_size;
     let fft_nyquist = fft_size / 2;
 
-    // Allocate a shitload of buffers ahead of time, dynamic allocations in a tight loop are bad mmkay.
+    // Allocate our buffers ahead of time, dynamic allocations in a tight loop are bad.
     let mut planner = FFTplanner::new(false);
     let fft = planner.plan_fft(fft_size);
     let mut sample_vec = VecDeque::with_capacity(fft_size);
@@ -124,7 +124,7 @@ fn fft_thread(
     let mut leds = vec![0.0; NUM_LEDS];
 
     // Only interested in the first half since the is real data, and because
-    // nyquist is a bitch.
+    // nyquist is a problem.
     let mut fft_energy = vec![0.0; fft_nyquist];
 
     // Calculate the overlap to faciliate a pseudo-welch's method.
