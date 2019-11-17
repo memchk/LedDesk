@@ -42,7 +42,11 @@ const NUM_LEDS: usize = 82;
 fn main() {
     let args = Args::from_args();
 
-    let color = RGB::from_hex(&args.color).saturate();
+    // We saturate the color to the maximum value while maintaing the hue
+    // to get the maximum dynamic range of the LEDs.
+    let color = RGB::from_hex(&args.color)
+        .saturate();
+
     let (audio_sender, audio_recv) = channel::bounded(args.fft_size);
     let _ = std::thread::spawn(move || audio_thread(audio_sender));
 
