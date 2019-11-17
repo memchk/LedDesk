@@ -8,7 +8,8 @@ edition = "2018"
 rustfft = "3.0.0"
 parking_lot = "0.7.1"
 lazy_static = "1.3.0"
-cpal = { path = "cpal" }
+# cpal = { path = "cpal" }
+cpal = { git = "https://github.com/RustAudio/cpal" }
 hound = "3.4.0"
 crossbeam = "0.7.1"
 serialport = "3.2.0"
