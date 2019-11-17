@@ -43,7 +43,6 @@ fn main() {
     let args = Args::from_args();
 
     let color = RGB::from_hex(&args.color).saturate();
-    println!("{:?}", color);
     let (audio_sender, audio_recv) = channel::bounded(args.fft_size);
     let _ = std::thread::spawn(move || audio_thread(audio_sender));
 
@@ -196,25 +195,43 @@ fn fft_thread(
 // Principal audio thread. This pulls data from windows WASAPI and streams it into a crossbeam
 // channel for further processing.
 fn audio_thread(audio_channel: channel::Sender<(f32, f32)>) {
-    let device = cpal::default_output_device().expect("Could not get output device.");
-    let format = device
-        .default_output_format()
-        .expect("Could not get output format.");
-    let event_loop = cpal::EventLoop::new();
-    let id = event_loop
-        .build_input_stream(&device, &format, true)
-        .unwrap();
+    use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
+    let host = cpal::default_host();
+    let event_loop = host.event_loop();
 
-    event_loop.play_stream(id);
-    event_loop.run(|_, data| match data {
-        cpal::StreamData::Input {
-            buffer: cpal::UnknownTypeInputBuffer::F32(buffer),
-        } => {
-            let lr_pairs = buffer.chunks_exact(2).map(|x| (x[0], x[1]));
-            for pair in lr_pairs {
-                let _ = audio_channel.try_send(pair);
+    let device = host.default_output_device().expect("Could not get output device.");
+
+    let mut supported_formats_range = device.supported_output_formats()
+    .expect("error while querying formats");
+    let format = supported_formats_range.next()
+    .expect("no supported format?!")
+    .with_max_sample_rate();
+
+    println!("Sample Rate: {}", format.sample_rate.0);
+
+    let stream_id = event_loop.build_input_stream(&device, &format).unwrap();
+
+    event_loop.play_stream(stream_id).unwrap();
+    event_loop.run(move |stream_id, stream_result| {
+        
+        let data = match stream_result {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("an error occurred on stream {:?}: {}", stream_id, err);
+                return;
             }
+        };
+
+        match data {
+            cpal::StreamData::Input {
+                buffer: cpal::UnknownTypeInputBuffer::F32(buffer),
+            } => {
+                let lr_pairs = buffer.chunks_exact(2).map(|x| (x[0], x[1]));
+                for pair in lr_pairs {
+                    let _ = audio_channel.try_send(pair);
+                }
+            }
+            _ => {}
         }
-        _ => {}
     });
 }
