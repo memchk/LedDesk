@@ -34,6 +34,14 @@ impl Window for NutallWindow {
     }
 }
 
+pub struct BlackmanHarrisWindow;
+impl Window for BlackmanHarrisWindow {
+    fn window(&self, data: &[f32], output: &mut [Complex<f32>]) {
+        sinc_window_inner(&[0.35875, 0.48829, 0.14128, 0.01168], data, output);
+    }
+}
+
 pub fn f_to_bin(fft_size: usize, fs: f32, f: f32) -> usize {
     (f * (fft_size as f32 / fs)) as usize
 }
+

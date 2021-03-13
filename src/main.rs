@@ -12,7 +12,7 @@ mod process;
 mod strided_chunks;
 
 use color::RGB;
-use math::{NutallWindow, Window};
+use math::{BlackmanHarrisWindow, Window, NutallWindow, f_to_bin};
 use process::{Process, ProcessMut};
 
 #[derive(StructOpt, Debug, Clone)]
@@ -23,18 +23,36 @@ struct Args {
     com_port: String,
     #[structopt(default_value = "0.04", long = "decay")]
     decay_time: f32,
-    #[structopt(default_value = "1", long = "fftscale")]
-    fftscale: f32,
+    // #[structopt(default_value = "1", long = "fftscale")]
+    // fftscale: f32,
     #[structopt(default_value = "8000", long = "mf")]
     mf: f32,
     #[structopt(long = "fft", default_value = "1536")]
     fft_size: usize,
+    #[structopt(long = "overlap", default_value = "0.5")]
+    overlap: f32,
     #[structopt(long = "exp", default_value = "1.0")]
     exp: f32,
-    #[structopt(long = "prescale", default_value = "2.0")]
-    prescale: f32,
+    #[structopt(long = "agct", default_value = "1")]
+    agc_target: f32,
+    #[structopt(long = "agclen", default_value = "1")]
+    agc_len: usize,
     #[structopt(long = "color", default_value = "FF00FF")]
     color: String,
+    #[structopt(long = "noagc")]
+    no_agc: bool,
+    #[structopt(long = "hdr")]
+    hdr: bool,
+    #[structopt(long = "shdr")]
+    super_hdr: bool,
+    #[structopt(long = "preagc")]
+    preagc: bool,
+    #[structopt(default_value = "3", long = "boom")]
+    boom_count: usize,
+    #[structopt(default_value = "FF0000", long = "boom-color")]
+    boom_color: String,
+    #[structopt(default_value = "1.0", long = "lincor")]
+    lin_cor: f32
 }
 
 const NUM_LEDS: usize = 82;
@@ -47,12 +65,15 @@ fn main() {
     let color = RGB::from_hex(&args.color)
         .saturate();
 
+    let boom_color = RGB::from_hex(&args.boom_color);
+
     let (audio_sender, audio_recv) = channel::bounded(args.fft_size);
     let _ = std::thread::spawn(move || audio_thread(audio_sender));
 
     let (led_sender, led_recv) = channel::bounded(NUM_LEDS);
+    let (power_sender, power_recv) = channel::bounded(NUM_LEDS);
     let cloned_args = args.clone();
-    let _ = std::thread::spawn(move || fft_thread(audio_recv, led_sender, cloned_args));
+    let _ = std::thread::spawn(move || fft_thread(audio_recv, led_sender, power_sender, cloned_args));
 
 
     // Main thread takes care of sending the data down UART to micro for display.
@@ -77,30 +98,24 @@ fn main() {
             .iter()
             .take(NUM_LEDS)
             .enumerate()
-            .map(|(_, b)| b * color);
+            .map(|(_, b)| if args.super_hdr { color * RGB::super_hdr(b) } else if args.hdr { color * RGB::hdr(b) } else { b * color });
 
         frame.clear();
         frame.extend(frame_iter);
 
-        let bar_e = 0;
-        let l_bar: Vec<_> = std::iter::repeat(bar_e)
+        let power_data : Vec<_> = power_recv.iter()
             .take(50)
-            .map(|e| color::RGB::new(e, e, e))
-            .collect();
-
-        let r_bar: Vec<_> = std::iter::repeat(bar_e)
-            .take(50)
-            .map(|e| color::RGB::new(e, e, e))
+            .map(|e| if args.super_hdr {RGB::super_hdr(e)} else {e * boom_color})
             .collect();
 
         buf.extend_from_slice(b"Ada");
         buf.extend_from_slice(&[0x01, 0x06, 0x52]);
 
         buf.extend(frame.iter().rev().flat_map(color::RGB::as_slice));
-        buf.extend(l_bar.iter().flat_map(color::RGB::as_slice));
+        buf.extend(power_data.iter().flat_map(color::RGB::as_slice));
         // Bottom
         buf.extend(frame.iter().flat_map(color::RGB::as_slice));
-        buf.extend(r_bar.iter().flat_map(color::RGB::as_slice));
+        buf.extend(power_data.iter().flat_map(color::RGB::as_slice));
 
         let _ = led_port.write_all(&buf);
         let _ = led_port.flush();
@@ -112,6 +127,7 @@ fn main() {
 fn fft_thread(
     audio_reciever: channel::Receiver<(f32, f32)>,
     led_sender: channel::Sender<f32>,
+    power_sender: channel::Sender<f32>,
     args: Args,
 ) {
     let fft_size = args.fft_size;
@@ -121,9 +137,11 @@ fn fft_thread(
     let mut planner = FFTplanner::new(false);
     let fft = planner.plan_fft(fft_size);
     let mut sample_vec = VecDeque::with_capacity(fft_size);
+    sample_vec.resize(fft_size, 0.0);
     let mut windowed_samples = vec![Complex::default(); fft_size];
     let mut fft_data = vec![Complex::default(); fft_size];
     let mut f32_scratch = vec![0.0; fft_size];
+    let mut agc_scratch = vec![0.0; fft_size];
     let mut leds = vec![0.0; NUM_LEDS];
 
     // Only interested in the first half since the is real data, and because
@@ -131,7 +149,7 @@ fn fft_thread(
     let mut fft_energy = vec![0.0; fft_nyquist];
 
     // Calculate the overlap to faciliate a pseudo-welch's method.
-    let overlap = fft_size / 2;
+    let overlap = (fft_size as f32 * args.overlap) as usize;
 
     // Setup the principal decay engine.
     let mut fft_decay = process::ExpDecay::new(
@@ -141,6 +159,21 @@ fn fft_thread(
         1.0,
     );
 
+    let fft_high_bin = f_to_bin(fft_size, 44100.0, args.mf);
+
+    //let agc_sections = args.agc_sections * (fft_nyquist / fft_high_bin);
+    //println!("{}", agc_sections);
+    //let agc_chunk_size = (fft_nyquist + agc_sections - 1) / agc_sections;
+    let mut agc = process::AGC::new(args.agc_len, args.agc_target, args.lin_cor);
+    
+    let mut pre_agc: Box<dyn ProcessMut<_,_>> = if args.preagc {
+        Box::new(process::TimeAGC::new(args.agc_len, 1.0))
+    } else {
+        Box::new(process::PassThrough)
+    };
+    //let mut agcs : Vec<process::AGC> = std::iter::repeat_with(|| process::AGC::new(args.agc_len, args.agc_target, 1))
+        // .take(agc_sections)
+        // .collect();
     // Setup the Frequency -> LED mapper.
     let led_map = process::PageLog::new(fft_size, 44100.0, args.mf, NUM_LEDS);
 
@@ -164,15 +197,32 @@ fn fft_thread(
         scratch_l.copy_from_slice(sample_left);
         scratch_r.copy_from_slice(sample_right);
 
+        // for (section, (in_chunk, out_chunk)) in f32_scratch.chunks(agc_chunk_size).zip(agc_scratch.chunks_mut(agc_chunk_size)).enumerate() {
+        //     agcs[section].process(&in_chunk[..], &mut out_chunk[..], 0.0);
+        // }
+
+        pre_agc.process(&f32_scratch[..], &mut agc_scratch[..], 0.0);
+
         // Window the data to prevent spectral contamination, then compute the FFT.
-        NutallWindow.window(&f32_scratch[..], &mut windowed_samples[..]);
+        NutallWindow.window(&agc_scratch[..], &mut windowed_samples[..]);
         fft.process(&mut windowed_samples[..], &mut fft_data[..]);
 
         for (c, a) in fft_data.iter().zip(fft_energy.iter_mut()) {
-            // First get the amplitude, normalize by dividing by the nyquist bin, then apply a prescaler.
-            let amplitude = args.prescale * c.to_polar().0 / fft_nyquist as f32;
-            // Apply a power function to require at args.exp > 1.0 a more powerful signal to trigger an led activation.
-            *a = amplitude.powf(args.exp);
+            // First get the amplitude, normalize by dividing by the nyquist bin.
+            let norm = c.to_polar().0 / fft_nyquist as f32;
+            *a = norm;
+        }
+
+        // for (section, (in_chunk, out_chunk)) in fft_energy.chunks(agc_chunk_size).zip(f32_scratch.chunks_mut(agc_chunk_size)).enumerate() {
+        //     agcs[section].process(&in_chunk[..], &mut out_chunk[..], 0.0);
+        // }
+
+        agc.process(&fft_energy[..], &mut f32_scratch[..], 0.0);
+
+        for (c, a) in f32_scratch.iter().zip(fft_energy.iter_mut()) {
+            // powf
+            let pow = c.powf(args.exp);
+            *a = pow;
         }
 
         // Process the decay, then calculate the log magnitude from there.
@@ -184,8 +234,19 @@ fn fft_thread(
                 *o = 0.0;
             } else {
                 //*o = args.fftscale * i.sqrt();
-                *o = args.fftscale * i;
+                *o = i;
             }
+        }
+        
+        let power_value = if args.boom_count > 0 {
+            fft_energy[0..args.boom_count].iter().fold(0.0, |a, e| a + e) / args.boom_count as f32
+        } else {
+            0.0
+        };
+
+        let power_data = std::iter::repeat(power_value).take(50);
+        for x in power_data {
+            let _ = power_sender.try_send(x);
         }
 
         // Map to leds, and send to the main thread for display.
